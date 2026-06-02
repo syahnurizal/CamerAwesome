@@ -104,9 +104,32 @@
 // TODO: move this to a QualityController
 /// Assign the default preview qualities
 - (void)setBestPreviewQuality {
+  // For PHOTO capture, use the Photo preset so the live preview (video data
+  // output) shares the same 4:3 field of view as the captured still. The
+  // original code picked the highest preset (4K = 16:9) for the preview, which
+  // made the live preview a different aspect/FOV than the 4:3 photo and broke
+  // WYSIWYG (the saved image did not match what the preview framed).
+  if (_captureMode != Video &&
+      [_captureSession canSetSessionPreset:AVCaptureSessionPresetPhoto]) {
+    [_captureSession setSessionPreset:AVCaptureSessionPresetPhoto];
+    _currentPreset = AVCaptureSessionPresetPhoto;
+
+    // Derive the real preview frame size (4:3) from the device active format so
+    // the Flutter preview lays out with the correct aspect ratio.
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(
+        _captureDevice.activeFormat.formatDescription);
+    if (dims.width > 0 && dims.height > 0) {
+      _currentPreviewSize = CGSizeMake(dims.width, dims.height);
+    } else {
+      _currentPreviewSize = CGSizeMake(4032, 3024);
+    }
+    [_videoController setPreviewSize:_currentPreviewSize];
+    return;
+  }
+
   NSArray *qualities = [CameraQualities captureFormatsForDevice:_captureDevice];
   PreviewSize *firstPreviewSize = [qualities count] > 0 ? qualities.lastObject : [PreviewSize makeWithWidth:@3840 height:@2160];
-  
+
   CGSize firstSize = CGSizeMake([firstPreviewSize.width floatValue], [firstPreviewSize.height floatValue]);
   [self setCameraPreset:firstSize];
 }
