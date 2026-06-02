@@ -137,51 +137,44 @@ previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer
 }
 
 - (UIImage *)imageByCroppingImage:(UIImage *)image toSize:(CGSize)size {
-  double newCropWidth, newCropHeight;
+  // Center-crop the RAW sensor buffer to the configured aspect ratio.
+  //
+  // The original code mixed two coordinate spaces: it derived the crop rect from
+  // `image.size` (orientation-adjusted — axes swapped for portrait) but applied
+  // it to `[image CGImage]` (the raw, un-rotated pixel buffer). That offset the
+  // captured frame versus the preview (the preview is a Flutter texture of the
+  // full video buffer, shown with CameraPreviewFit.contain = full frame visible).
+  // Operating purely on raw pixels keeps capture aligned with preview.
+  // For 4:3 (the sensor's native ratio on iPhone) this is a no-op.
+  CGImageRef sourceRef = [image CGImage];
+  double rawWidth  = (double)CGImageGetWidth(sourceRef);
+  double rawHeight = (double)CGImageGetHeight(sourceRef);
 
-  if(image.size.width < image.size.height) {
-    if (image.size.width < size.width) {
-      newCropWidth = size.width;
-    } else {
-      newCropWidth = image.size.width;
-    }
-    newCropHeight = (newCropWidth * size.height)/size.width;
-  } else {
-    if (image.size.height < size.height) {
-      newCropHeight = size.height;
-    } else {
-      newCropHeight = image.size.height;
-    }
-    newCropWidth = (newCropHeight * size.width)/size.height;
+  // _aspectRatio is long-side / short-side (e.g. 4/3, 16/9, 1).
+  double targetAspect  = (_aspectRatio > 0) ? _aspectRatio : (rawWidth / rawHeight);
+  double currentAspect = rawWidth / rawHeight;
+
+  double cropWidth  = rawWidth;
+  double cropHeight = rawHeight;
+  if (currentAspect > targetAspect) {
+    // Buffer wider than target: trim width, keep full height.
+    cropWidth = rawHeight * targetAspect;
+  } else if (currentAspect < targetAspect) {
+    // Buffer taller than target: trim height, keep full width.
+    cropHeight = rawWidth / targetAspect;
   }
-  
-  double imageHeightDivided = image.size.height/2.0;
-  double imageWidthDivided = image.size.width/2.0;
-  
-  double x = imageWidthDivided - newCropWidth/2.0;
-  double y = imageHeightDivided - newCropHeight/2.0;
-  
-  CGRect cropRect;
-  if (UIDeviceOrientationIsLandscape(_orientation)) {
-    cropRect = CGRectMake(x, y, newCropWidth, newCropHeight);
-  } else {
-    if (_aspectRatioType == Ratio16_9) {
-      cropRect = CGRectMake(0, 0, image.size.height, image.size.width);
-    } else {
-      if (_aspectRatioType == Ratio4_3) {
-        double localX = imageHeightDivided - (imageHeightDivided / _aspectRatio);
-        cropRect = CGRectMake(localX, 0, image.size.height / _aspectRatio, image.size.width);
-      } else {
-        cropRect = CGRectMake(y, x, newCropWidth, newCropHeight);
-      }
-    }
-  }
-  
-  CGImageRef imageRef = CGImageCreateWithImageInRect([image CGImage], cropRect);
-  
+
+  CGRect cropRect = CGRectMake(
+    round((rawWidth  - cropWidth)  / 2.0),
+    round((rawHeight - cropHeight) / 2.0),
+    round(cropWidth),
+    round(cropHeight)
+  );
+
+  CGImageRef imageRef = CGImageCreateWithImageInRect(sourceRef, cropRect);
   UIImage *cropped = [UIImage imageWithCGImage:imageRef];
   CGImageRelease(imageRef);
-  
+
   return cropped;
 }
 
