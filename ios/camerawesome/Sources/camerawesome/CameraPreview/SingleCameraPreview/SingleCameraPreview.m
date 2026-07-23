@@ -201,26 +201,31 @@
 
   // Determine the target size based on the current mode and settings
   if (_captureMode == Video || _videoController.isRecording) {
-      // If recording video, prioritize the recording quality setting
-      // TODO: Need a way to get the CGSize from the _recordingQuality enum or _videoOptions
-      // For now, let's assume a helper function or default high quality if direct mapping isn't obvious.
-      // Placeholder: If video options exist, try to use them, otherwise fall back.
-      // If no direct mapping, maybe use the highest available preset suitable for video?
-      // Or just pass CGSizeZero to let selectVideoCapturePreset pick the best for video?
-      // For now, let's pass CGSizeZero to select the best default for video capture.
-      if (_videoOptions != nil) {
-         // Hypothetical: Get size from VideoOptions quality. Needs actual implementation.
-         // targetSize = [CameraQualities sizeFromQuality:_recordingQuality];
-         // If no direct mapping, maybe use the highest available preset suitable for video?
-         // Or just pass CGSizeZero to let selectVideoCapturePreset pick the best for video?
-         // For now, let's pass CGSizeZero to select the best default for video capture.
-         targetSize = CGSizeZero; 
-      } else if (!CGSizeEqualToSize(currentPreviewSize, CGSizeZero)){
-         // Use provided size if valid and no video options
-         targetSize = currentPreviewSize;
-      } else {
-         // Fallback to best quality if no specific size or options given
-         targetSize = CGSizeZero;
+      // Select a session preset that matches the requested recording quality so the
+      // live preview and the recorded file share the SAME aspect ratio (WYSIWYG). The
+      // previous code passed CGSizeZero here, letting computeBestPresetWithSession pick
+      // an arbitrary device "best" preset whose aspect could differ from the writer's
+      // declared output -> stretched preview/video. Map the quality enum to a preset
+      // size that CameraQualities.selectPresetForSize understands; selectVideoCapturePreset
+      // falls back to the best available preset if the mapped one is unsupported.
+      switch (_recordingQuality) {
+        case VideoRecordingQualityUhd:
+        case VideoRecordingQualityHighest:
+          targetSize = CGSizeMake(3840, 2160);
+          break;
+        case VideoRecordingQualityFhd:
+          targetSize = CGSizeMake(1920, 1080);
+          break;
+        case VideoRecordingQualityHd:
+          targetSize = CGSizeMake(1280, 720);
+          break;
+        case VideoRecordingQualitySd:
+        case VideoRecordingQualityLowest:
+          targetSize = CGSizeMake(640, 480);
+          break;
+        default:
+          targetSize = CGSizeZero;
+          break;
       }
   } else if (_imageStreamController.streamImages) {
       // If only streaming (not recording), force 720p for potential stability (based on commit history)

@@ -98,8 +98,26 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
   // Read from options if available
   AVVideoCodecType codecType = [self getBestCodecTypeAccordingOptions:options];
   AVFileType fileType = [self getBestFileTypeAccordingOptions:options];
-  CGSize videoSize = [self getBestVideoSizeAccordingQuality: _recordingQuality];
-    
+
+  // Derive the writer output size from the ACTUAL capture buffer size (_previewSize,
+  // which equals the dimensions of the pixel buffers appended to _videoAdaptor), using
+  // the requested recording quality only as a resolution cap that PRESERVES the buffer
+  // aspect ratio. Previously the output was taken straight from the quality table
+  // (e.g. Hd = 1280x720) regardless of the real buffer aspect; when the capture
+  // session ran at a different aspect ratio, AVFoundation scaled each frame
+  // non-uniformly into the declared box => stretched video (e.g. iPhone comment video).
+  CGSize videoSize;
+  if (_previewSize.width > 0 && _previewSize.height > 0) {
+    CGSize cap = [self getBestVideoSizeAccordingQuality:_recordingQuality];
+    double scale = fmin(1.0, fmin(cap.width / _previewSize.width,
+                                  cap.height / _previewSize.height));
+    videoSize = CGSizeMake(round(_previewSize.width * scale),
+                           round(_previewSize.height * scale));
+  } else {
+    // Fallback: no preview size known, keep prior behaviour.
+    videoSize = [self getBestVideoSizeAccordingQuality:_recordingQuality];
+  }
+
   NSDictionary *videoSettings = @{
     AVVideoCodecKey   : codecType,
     AVVideoWidthKey   : @(videoSize.height),
