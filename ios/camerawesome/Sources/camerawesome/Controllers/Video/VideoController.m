@@ -6,6 +6,7 @@
 //
 
 #import "VideoController.h"
+#import "CameraQualities.h"
 
 FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
 
@@ -114,8 +115,10 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
     videoSize = CGSizeMake(round(_previewSize.width * scale),
                            round(_previewSize.height * scale));
   } else {
-    // Fallback: no preview size known, keep prior behaviour.
-    videoSize = [self getBestVideoSizeAccordingQuality:_recordingQuality];
+    // No preview size yet, so there is no buffer aspect to preserve. Use the
+    // quality's target size directly -- getBestVideoSizeAccordingQuality: would
+    // clamp against the (zero) _previewSize and yield an empty size.
+    videoSize = [CameraQualities targetSizeForQuality:_recordingQuality];
   }
 
   NSDictionary *videoSettings = @{
@@ -381,37 +384,22 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
 }
 
 - (CGSize)getBestVideoSizeAccordingQuality:(VideoRecordingQuality)quality {
-  CGSize size;
-  switch (quality) {
-    case VideoRecordingQualityUhd:
-    case VideoRecordingQualityHighest:
-      if (@available(iOS 9.0, *)) {
-        if ([_captureDevice supportsAVCaptureSessionPreset:AVCaptureSessionPreset3840x2160]) {
-          size = CGSizeMake(3840, 2160);
-        } else {
-          size = CGSizeMake(1920, 1080);
-        }
-      } else {
-        return CGSizeMake(1920, 1080);
-      }
-      break;
-    case VideoRecordingQualityFhd:
+  // Shared quality -> size table (see CameraQualities), then apply the two
+  // device/session-dependent adjustments that only the recorder knows about.
+  CGSize size = [CameraQualities targetSizeForQuality:quality];
+
+  // 4K is not available on every device; fall back to 1080p when unsupported.
+  if (quality == VideoRecordingQualityUhd || quality == VideoRecordingQualityHighest) {
+    if (![_captureDevice supportsAVCaptureSessionPreset:AVCaptureSessionPreset3840x2160]) {
       size = CGSizeMake(1920, 1080);
-      break;
-    case VideoRecordingQualityHd:
-      size = CGSizeMake(1280, 720);
-      break;
-    case VideoRecordingQualitySd:
-    case VideoRecordingQualityLowest:
-      size = CGSizeMake(960, 540);
-      break;
+    }
   }
-    
+
   // ensure video output size does not exceed capture session size
   if (size.width > _previewSize.width) {
     size = _previewSize;
   }
-  
+
   return size;
 }
 

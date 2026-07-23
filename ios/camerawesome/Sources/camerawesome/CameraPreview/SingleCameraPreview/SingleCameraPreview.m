@@ -205,28 +205,9 @@
       // live preview and the recorded file share the SAME aspect ratio (WYSIWYG). The
       // previous code passed CGSizeZero here, letting computeBestPresetWithSession pick
       // an arbitrary device "best" preset whose aspect could differ from the writer's
-      // declared output -> stretched preview/video. Map the quality enum to a preset
-      // size that CameraQualities.selectPresetForSize understands; selectVideoCapturePreset
-      // falls back to the best available preset if the mapped one is unsupported.
-      switch (_recordingQuality) {
-        case VideoRecordingQualityUhd:
-        case VideoRecordingQualityHighest:
-          targetSize = CGSizeMake(3840, 2160);
-          break;
-        case VideoRecordingQualityFhd:
-          targetSize = CGSizeMake(1920, 1080);
-          break;
-        case VideoRecordingQualityHd:
-          targetSize = CGSizeMake(1280, 720);
-          break;
-        case VideoRecordingQualitySd:
-        case VideoRecordingQualityLowest:
-          targetSize = CGSizeMake(640, 480);
-          break;
-        default:
-          targetSize = CGSizeZero;
-          break;
-      }
+      // declared output -> stretched preview/video. selectVideoCapturePreset falls back
+      // to the best available preset if the mapped size is unsupported.
+      targetSize = [CameraQualities targetSizeForQuality:_recordingQuality];
   } else if (_imageStreamController.streamImages) {
       // If only streaming (not recording), force 720p for potential stability (based on commit history)
       targetSize = CGSizeMake(720, 1280);
