@@ -292,7 +292,14 @@ data class CameraXState(
 
     private fun buildVideoCapture(videoOptions: AndroidVideoOptions?): VideoCapture<Recorder> {
         val recorderBuilder = Recorder.Builder()
-        // Aspect ratio is handled by the setViewPort on the UseCaseGroup
+
+        // Record at the SAME aspect ratio as the preview. Quality.HD/FHD/UHD are all
+        // 16:9, so a 4:3 preview previously recorded a 16:9 sensor readout and the saved
+        // video lost the top/bottom of what the preview framed. The UseCaseGroup ViewPort
+        // cannot restore FOV the readout already dropped, so the recorder has to be told
+        // the aspect ratio directly.
+        recorderBuilder.setAspectRatio(aspectRatio ?: AspectRatio.RATIO_4_3)
+
         if (videoRecordingQuality != null) {
             val quality = when (videoRecordingQuality) {
                 VideoRecordingQuality.LOWEST -> Quality.LOWEST

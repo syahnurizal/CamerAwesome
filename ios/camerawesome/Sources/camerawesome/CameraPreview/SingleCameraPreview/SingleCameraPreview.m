@@ -127,11 +127,79 @@
     return;
   }
 
+  // For VIDEO capture, record in 4:3 so the saved video matches the 4:3 preview the UI
+  // frames. Every AVCaptureSession video preset is 16:9 except low-res 640x480, so a
+  // usable 4:3 recording has to come from a 4:3 activeFormat rather than a preset.
+  if (_captureMode == Video) {
+    AVCaptureDeviceFormat *fourThreeFormat = [self bestFourThreeVideoFormat];
+    if (fourThreeFormat != nil) {
+      // InputPriority stops the session preset from overriding activeFormat.
+      if ([_captureSession canSetSessionPreset:AVCaptureSessionPresetInputPriority]) {
+        [_captureSession setSessionPreset:AVCaptureSessionPresetInputPriority];
+        _currentPreset = AVCaptureSessionPresetInputPriority;
+      }
+
+      NSError *formatError = nil;
+      if ([_captureDevice lockForConfiguration:&formatError]) {
+        _captureDevice.activeFormat = fourThreeFormat;
+        // Pin to 30fps; activeFormat resets the frame duration.
+        CMTime frameDuration = CMTimeMake(1, 30);
+        _captureDevice.activeVideoMinFrameDuration = frameDuration;
+        _captureDevice.activeVideoMaxFrameDuration = frameDuration;
+        [_captureDevice unlockForConfiguration];
+      }
+
+      CMVideoDimensions dims =
+          CMVideoFormatDescriptionGetDimensions(fourThreeFormat.formatDescription);
+      _currentPreviewSize = CGSizeMake(dims.width, dims.height);
+      [_videoController setPreviewSize:_currentPreviewSize];
+      return;
+    }
+    // No 4:3 format on this device: fall through to the preset-based path below.
+  }
+
   NSArray *qualities = [CameraQualities captureFormatsForDevice:_captureDevice];
   PreviewSize *firstPreviewSize = [qualities count] > 0 ? qualities.lastObject : [PreviewSize makeWithWidth:@3840 height:@2160];
 
   CGSize firstSize = CGSizeMake([firstPreviewSize.width floatValue], [firstPreviewSize.height floatValue]);
   [self setCameraPreset:firstSize];
+}
+
+/// Highest-resolution 4:3 video format that can sustain 30fps, capped so recordings stay
+/// a sane size. Returns nil when the device exposes no suitable 4:3 format.
+- (AVCaptureDeviceFormat *)bestFourThreeVideoFormat {
+  // Cap at the 1440x1080 class: the recorder scales down to the quality cap anyway, so
+  // larger formats only cost buffer-processing time.
+  const int32_t maxWidth = 1440;
+  AVCaptureDeviceFormat *best = nil;
+  int32_t bestWidth = 0;
+
+  for (AVCaptureDeviceFormat *format in _captureDevice.formats) {
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+
+    // 4:3 only (width * 3 == height * 4), and within the size cap.
+    if (dims.width * 3 != dims.height * 4 || dims.width > maxWidth) {
+      continue;
+    }
+
+    BOOL supports30fps = NO;
+    for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
+      if (range.minFrameRate <= 30.0 && range.maxFrameRate >= 30.0) {
+        supports30fps = YES;
+        break;
+      }
+    }
+    if (!supports30fps) {
+      continue;
+    }
+
+    if (dims.width > bestWidth) {
+      bestWidth = dims.width;
+      best = format;
+    }
+  }
+
+  return best;
 }
 
 /// Save exif preferences when taking picture
@@ -486,7 +554,15 @@
   }
   
   _captureMode = captureMode;
-  
+
+  // Re-apply the session configuration for the new mode: video wants the 4:3
+  // activeFormat, photo wants the Photo preset. Without this the session keeps whatever
+  // the previous mode set, so a photo->video switch would record with the photo config
+  // (and vice versa).
+  [_captureSession beginConfiguration];
+  [self setBestPreviewQuality];
+  [_captureSession commitConfiguration];
+
   if (captureMode == Video) {
     [self setUpCaptureSessionForAudioError:^(NSError *audioError) {
       *error = [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"error when trying to setup audio" details:[audioError localizedDescription]];
