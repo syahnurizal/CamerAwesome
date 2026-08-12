@@ -29,6 +29,7 @@ import com.apparence.camerawesome.buttons.PlayerService
 import com.apparence.camerawesome.models.FlashMode
 import com.apparence.camerawesome.sensors.SensorOrientationListener
 import com.apparence.camerawesome.utils.isMultiCamSupported
+import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
@@ -46,6 +47,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 
@@ -53,6 +55,15 @@ import kotlin.math.roundToInt
 enum class CaptureModes {
     PHOTO, VIDEO, PREVIEW, ANALYSIS_ONLY,
 }
+
+/** How long a capture may wait on a location fix for the EXIF GPS tag. */
+private const val LOCATION_TIMEOUT_MS = 3_000L
+
+/** Grace period before the watchdog fires, in case Play Services is just slow. */
+private const val LOCATION_TIMEOUT_MARGIN_MS = 500L
+
+/** A cached fix this recent is good enough; avoids waiting on a fresh one. */
+private const val LOCATION_MAX_AGE_MS = 60_000L
 
 class CameraAwesomeX : CameraInterface, FlutterPlugin, ActivityAware {
     private lateinit var physicalButtonHandler: PhysicalButtonsHandler
@@ -314,31 +325,61 @@ class CameraAwesomeX : CameraInterface, FlutterPlugin, ActivityAware {
     }
 
     /***
-     * [fusedLocationClient.getCurrentLocation] takes time, we might want to use
-     * [fusedLocationClient.lastLocation] instead to go faster
+     * Resolves a location for the EXIF GPS tag, on a hard deadline.
+     *
+     * This sits on the critical path of [takePhotoWith]: the capture is not
+     * reported back to Dart until [callback] fires. The previous implementation
+     * called [FusedLocationProviderClient.getCurrentLocation] with the default
+     * [CurrentLocationRequest], whose duration is unbounded, so it waited for a
+     * fresh PRIORITY_HIGH_ACCURACY fix - indoors that can take minutes or never
+     * arrive, and the shutter appeared dead for the whole time.
+     *
+     * [callback] is now guaranteed to be invoked exactly once, within
+     * [LOCATION_TIMEOUT_MS] + a small margin, with null when no fix is
+     * available. A cached fix up to a minute old is accepted.
      */
     @SuppressLint("MissingPermission")
     private fun retrieveLocation(callback: (Location?) -> Unit) {
-        if (exifPreferences.saveGPSLocation && ActivityCompat.checkSelfPermission(
-                activity!!, Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
+        val currentActivity = activity
+        if (!exifPreferences.saveGPSLocation || currentActivity == null || !::fusedLocationClient.isInitialized || ActivityCompat.checkSelfPermission(
+                currentActivity, Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
         ) {
-            fusedLocationClient.getCurrentLocation(
-                Priority.PRIORITY_HIGH_ACCURACY, cancellationTokenSource.token
-            ).addOnCompleteListener {
-                if (it.isSuccessful) {
-                    callback(it.result)
-                } else {
-                    if (it.exception != null) {
-                        Log.e(
-                            CamerawesomePlugin.TAG, "Error finding location", it.exception
-                        )
-                    }
-                    callback(null)
-                }
-            }
-        } else {
             callback(null)
+            return
+        }
+
+        val delivered = AtomicBoolean(false)
+        val deliver = { location: Location? ->
+            if (delivered.compareAndSet(false, true)) callback(location)
+        }
+
+        // Watchdog: Play Services can leave the task pending indefinitely (no
+        // fix, service disabled mid-request), and nothing else would resume the
+        // capture.
+        val watchdog = Handler(Looper.getMainLooper())
+        val onTimeout = Runnable { deliver(null) }
+        watchdog.postDelayed(onTimeout, LOCATION_TIMEOUT_MS + LOCATION_TIMEOUT_MARGIN_MS)
+
+        try {
+            val request = CurrentLocationRequest.Builder()
+                .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+                .setDurationMillis(LOCATION_TIMEOUT_MS)
+                .setMaxUpdateAgeMillis(LOCATION_MAX_AGE_MS)
+                .build()
+            fusedLocationClient.getCurrentLocation(
+                request, cancellationTokenSource.token
+            ).addOnCompleteListener {
+                watchdog.removeCallbacks(onTimeout)
+                if (!it.isSuccessful && it.exception != null) {
+                    Log.e(CamerawesomePlugin.TAG, "Error finding location", it.exception)
+                }
+                deliver(if (it.isSuccessful) it.result else null)
+            }
+        } catch (e: Throwable) {
+            Log.e(CamerawesomePlugin.TAG, "Error requesting location", e)
+            watchdog.removeCallbacks(onTimeout)
+            deliver(null)
         }
     }
 
@@ -384,53 +425,72 @@ class CameraAwesomeX : CameraInterface, FlutterPlugin, ActivityAware {
         imageCapture.takePicture(outputFileOptions,
             ContextCompat.getMainExecutor(activity!!),
             object : ImageCapture.OnImageSavedCallback {
+                // The JPEG is already on disk by the time this fires, so every
+                // post-processing step below is best-effort: it must never be
+                // able to leave the continuation unresumed, or the Dart future
+                // hangs forever and the shutter goes dead.
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    if (colorMatrix != null && noneFilter != colorMatrix) {
-                        val exif = ExifInterface(outputFileResults.savedUri!!.path!!)
-
-                        val originalBitmap = BitmapFactory.decodeFile(
-                            outputFileResults.savedUri?.path
-                        )
-                        val bitmapCopy = Bitmap.createBitmap(
-                            originalBitmap.width, originalBitmap.height, Bitmap.Config.ARGB_8888
-                        )
-
-                        val canvas = Canvas(bitmapCopy)
-                        canvas.drawBitmap(originalBitmap, 0f, 0f, Paint().apply {
-                            colorFilter = ColorMatrixColorFilter(colorMatrix!!.map { it.toFloat() }
-                                .toFloatArray())
-                        })
-
-                        try {
-                            FileOutputStream(outputFileResults.savedUri?.path).use { out ->
-                                bitmapCopy.compress(
-                                    Bitmap.CompressFormat.JPEG, 100, out
-                                )
-                            }
-                            exif.saveAttributes()
-                        } catch (e: IOException) {
-                            e.printStackTrace()
-                        }
-                    }
-
-                    if (exifPreferences.saveGPSLocation) {
-                        retrieveLocation {
+                    try {
+                        if (colorMatrix != null && noneFilter != colorMatrix) {
                             val exif = ExifInterface(outputFileResults.savedUri!!.path!!)
-                            outputFileOptions.metadata.location = it
-                            exif.setGpsInfo(it)
-//                            Log.d("CAMERAX__EXIF", "GPS info saved ${it?.latitude} ${it?.longitude}")
-                            // We need to actually save the exif data to the file system
-                            exif.saveAttributes()
-                            continuation.resume(true)
+
+                            val originalBitmap = BitmapFactory.decodeFile(
+                                outputFileResults.savedUri?.path
+                            )
+                            val bitmapCopy = Bitmap.createBitmap(
+                                originalBitmap.width, originalBitmap.height, Bitmap.Config.ARGB_8888
+                            )
+
+                            val canvas = Canvas(bitmapCopy)
+                            canvas.drawBitmap(originalBitmap, 0f, 0f, Paint().apply {
+                                colorFilter =
+                                    ColorMatrixColorFilter(colorMatrix!!.map { it.toFloat() }
+                                        .toFloatArray())
+                            })
+
+                            try {
+                                FileOutputStream(outputFileResults.savedUri?.path).use { out ->
+                                    bitmapCopy.compress(
+                                        Bitmap.CompressFormat.JPEG, 100, out
+                                    )
+                                }
+                                exif.saveAttributes()
+                            } catch (e: IOException) {
+                                e.printStackTrace()
+                            }
                         }
-                    } else {
+
+                        if (exifPreferences.saveGPSLocation) {
+                            retrieveLocation { location ->
+                                try {
+                                    if (location != null) {
+                                        val exif =
+                                            ExifInterface(outputFileResults.savedUri!!.path!!)
+                                        outputFileOptions.metadata.location = location
+                                        exif.setGpsInfo(location)
+                                        // We need to actually save the exif data to the file system
+                                        exif.saveAttributes()
+                                    }
+                                } catch (e: Throwable) {
+                                    Log.e(
+                                        CamerawesomePlugin.TAG, "Error writing GPS exif data", e
+                                    )
+                                }
+                                if (continuation.isActive) continuation.resume(true)
+                            }
+                        } else {
+                            if (continuation.isActive) continuation.resume(true)
+                        }
+                    } catch (e: Throwable) {
+                        Log.e(CamerawesomePlugin.TAG, "Error post-processing picture", e)
+                        // The file itself was written, so this is still a success.
                         if (continuation.isActive) continuation.resume(true)
                     }
                 }
 
                 override fun onError(exception: ImageCaptureException) {
                     Log.e(CamerawesomePlugin.TAG, "Error capturing picture", exception)
-                    continuation.resume(false)
+                    if (continuation.isActive) continuation.resume(false)
                 }
             })
 //        }
