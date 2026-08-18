@@ -9,6 +9,10 @@
 
 @implementation SingleCameraPreview {
   dispatch_queue_t _dispatchQueue;
+  // TEMP INSTRUMENTATION (camera init timing investigation, remove after use):
+  // logs wall-clock time from SingleCameraPreview construction to first
+  // preview frame, once per CameraScreen open.
+  BOOL _timingFirstFrameLogged;
 }
 
 - (instancetype)initWithCameraSensor:(PigeonSensorPosition)sensor
@@ -22,7 +26,11 @@
                           completion:(nonnull void (^)(NSNumber * _Nullable, FlutterError * _Nullable))completion
                        dispatchQueue:(dispatch_queue_t)dispatchQueue {
   self = [super init];
-  
+
+  // TEMP INSTRUMENTATION (remove after use):
+  NSLog(@"CAMERA_TIMING_NATIVE init_start %f", CFAbsoluteTimeGetCurrent());
+  _timingFirstFrameLogged = NO;
+
   _completion = completion;
   _dispatchQueue = dispatchQueue;
   
@@ -757,6 +765,11 @@
 
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
   if (output == _captureVideoOutput) {
+    // TEMP INSTRUMENTATION (remove after use):
+    if (!_timingFirstFrameLogged) {
+      _timingFirstFrameLogged = YES;
+      NSLog(@"CAMERA_TIMING_NATIVE first_frame %f", CFAbsoluteTimeGetCurrent());
+    }
     [self.previewTexture updateBuffer:sampleBuffer];
     if (_onPreviewFrameAvailable) {
       _onPreviewFrameAvailable();
