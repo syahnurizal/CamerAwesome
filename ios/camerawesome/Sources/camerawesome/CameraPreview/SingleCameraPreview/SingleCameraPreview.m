@@ -322,14 +322,18 @@
 
 /// Dispose camera inputs & outputs
 - (void)dispose {
-  [self stop];
-  [self.physicalButtonController stopListening];
-  
-  for (AVCaptureInput *input in [_captureSession inputs]) {
-    [_captureSession removeInput:input];
-  }
-  for (AVCaptureOutput *output in [_captureSession outputs]) {
-    [_captureSession removeOutput:output];
+  // Tearing the session down must not overlap a startRunning already queued on
+  // _dispatchQueue. -stop takes the same recursive lock, so nesting is fine.
+  @synchronized (_captureSession) {
+    [self stop];
+    [self.physicalButtonController stopListening];
+
+    for (AVCaptureInput *input in [_captureSession inputs]) {
+      [_captureSession removeInput:input];
+    }
+    for (AVCaptureOutput *output in [_captureSession outputs]) {
+      [_captureSession removeOutput:output];
+    }
   }
 }
 
@@ -339,77 +343,99 @@
     *error = [FlutterError errorWithCode:@"PREVIEW_SIZE" message:@"impossible to change preview size, video already recording" details:@""];
     return;
   }
-  BOOL sessionIsRunning = _captureSession.isRunning;
-  if (sessionIsRunning) {
+  // AVFoundation throws an NSGenericException ("startRunning may not be called
+  // between calls to beginConfiguration and commitConfiguration") when the session
+  // is reconfigured on one thread while -startRunning runs on another. Flutter
+  // delivers this call on the main queue while start/stop run on _dispatchQueue,
+  // so every session mutation takes the session's own (recursive) lock.
+  @synchronized (_captureSession) {
+    BOOL sessionIsRunning = _captureSession.isRunning;
+    if (sessionIsRunning) {
       [_captureSession stopRunning];
-  }
-  [self setCameraPreset:previewSize];
-  if (sessionIsRunning) {
-    dispatch_async(_dispatchQueue, ^{
-      [self->_captureSession startRunning];
-    });
+    }
+    [self setCameraPreset:previewSize];
+    if (sessionIsRunning) {
+      [self start];
+    }
   }
 }
 
 /// Start camera preview
 - (void)start {
   dispatch_async(_dispatchQueue, ^{
-    [self->_captureSession startRunning];
+    // The lock keeps this out of any beginConfiguration/commitConfiguration block
+    // running on another thread. The @catch is a safety net: should a
+    // reconfiguration path ever be added without the lock, the session fails to
+    // start instead of throwing an uncaught NSGenericException that kills the app.
+    @synchronized (self->_captureSession) {
+      @try {
+        [self->_captureSession startRunning];
+      } @catch (NSException *exception) {
+        NSLog(@"camerawesome: -[AVCaptureSession startRunning] failed: %@ - %@", exception.name, exception.reason);
+      }
+    }
   });
 }
 
 /// Stop camera preview
 - (void)stop {
-  [_captureSession stopRunning];
+  @synchronized (_captureSession) {
+    [_captureSession stopRunning];
+  }
 }
 
 /// Set sensor between Front & Rear camera
 - (void)setSensor:(PigeonSensor *)sensor {
-  // Check if the session is running before changing the preset
-  BOOL sessionIsRunning = _captureSession.isRunning;
-  if (sessionIsRunning) {
-      [_captureSession stopRunning];
-  }
-  // First remove all input & output
-  [_captureSession beginConfiguration];
+  // AVFoundation throws an NSGenericException ("startRunning may not be called
+  // between calls to beginConfiguration and commitConfiguration") when the session
+  // is reconfigured on one thread while -startRunning runs on another. Flutter
+  // delivers this call on the main queue while start/stop run on _dispatchQueue,
+  // so every session mutation takes the session's own (recursive) lock.
+  @synchronized (_captureSession) {
+    // Check if the session is running before changing the preset
+    BOOL sessionIsRunning = _captureSession.isRunning;
+    if (sessionIsRunning) {
+        [_captureSession stopRunning];
+    }
+    // First remove all input & output
+    [_captureSession beginConfiguration];
   
-  // Only remove camera channel but keep audio
-  for (AVCaptureInput *input in [_captureSession inputs]) {
-    for (AVCaptureInputPort *port in input.ports) {
-      if ([[port mediaType] isEqual:AVMediaTypeVideo]) {
-        [_captureSession removeInput:input];
-        break;
+    // Only remove camera channel but keep audio
+    for (AVCaptureInput *input in [_captureSession inputs]) {
+      for (AVCaptureInputPort *port in input.ports) {
+        if ([[port mediaType] isEqual:AVMediaTypeVideo]) {
+          [_captureSession removeInput:input];
+          break;
+        }
       }
     }
-  }
-  // FIX: Changed from setAudioIsDisconnected to setVideoIsDisconnected.
-  // VIDEO is what's being switched (brief gap while new camera initializes),
-  // not audio. Setting the wrong flag caused audio timestamps to be offset
-  // while video timestamps weren't compensated for the gap, causing desync.
-  // The videoIsDisconnected flag triggers proper timestamp gap compensation
-  // in VideoController.m's captureOutput method.
-  [_videoController setVideoIsDisconnected:YES];
+    // FIX: Changed from setAudioIsDisconnected to setVideoIsDisconnected.
+    // VIDEO is what's being switched (brief gap while new camera initializes),
+    // not audio. Setting the wrong flag caused audio timestamps to be offset
+    // while video timestamps weren't compensated for the gap, causing desync.
+    // The videoIsDisconnected flag triggers proper timestamp gap compensation
+    // in VideoController.m's captureOutput method.
+    [_videoController setVideoIsDisconnected:YES];
 
-  [_captureSession removeOutput:_capturePhotoOutput];
-  [_captureSession removeConnection:_captureConnection];
+    [_captureSession removeOutput:_capturePhotoOutput];
+    [_captureSession removeConnection:_captureConnection];
   
-  _cameraSensorPosition = sensor.position;
-  _captureDeviceId = sensor.deviceId;
+    _cameraSensorPosition = sensor.position;
+    _captureDeviceId = sensor.deviceId;
   
-  // Init the camera preview with the selected sensor
-  [self initCameraPreview:sensor.position];
+    // Init the camera preview with the selected sensor
+    [self initCameraPreview:sensor.position];
 
-  // Update VideoController with new capture device to re-apply custom FPS if recording
-  // This fixes audio/video desync when switching cameras during recording with custom FPS
-  [_videoController updateCaptureDevice:_captureDevice];
+    // Update VideoController with new capture device to re-apply custom FPS if recording
+    // This fixes audio/video desync when switching cameras during recording with custom FPS
+    [_videoController updateCaptureDevice:_captureDevice];
 
-  [self setBestPreviewQuality];
+    [self setBestPreviewQuality];
   
-  [_captureSession commitConfiguration];
-  if (sessionIsRunning) {
-    dispatch_async(_dispatchQueue, ^{
-      [self->_captureSession startRunning];
-    });
+    [_captureSession commitConfiguration];
+    if (sessionIsRunning) {
+      [self start];
+    }
   }
 }
 
@@ -559,14 +585,22 @@
   // activeFormat, photo wants the Photo preset. Without this the session keeps whatever
   // the previous mode set, so a photo->video switch would record with the photo config
   // (and vice versa).
-  [_captureSession beginConfiguration];
-  [self setBestPreviewQuality];
-  [_captureSession commitConfiguration];
+  // AVFoundation throws an NSGenericException ("startRunning may not be called
+  // between calls to beginConfiguration and commitConfiguration") when the session
+  // is reconfigured on one thread while -startRunning runs on another. Flutter
+  // delivers this call on the main queue while start/stop run on _dispatchQueue,
+  // so every session mutation takes the session's own (recursive) lock.
+  @synchronized (_captureSession) {
+    [_captureSession beginConfiguration];
+    [self setBestPreviewQuality];
+    [_captureSession commitConfiguration];
 
-  if (captureMode == Video) {
-    [self setUpCaptureSessionForAudioError:^(NSError *audioError) {
-      *error = [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"error when trying to setup audio" details:[audioError localizedDescription]];
-    }];
+    // Also inside the lock: this adds the audio input/output to the session.
+    if (captureMode == Video) {
+      [self setUpCaptureSessionForAudioError:^(NSError *audioError) {
+        *error = [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"error when trying to setup audio" details:[audioError localizedDescription]];
+      }];
+    }
   }
 }
 
@@ -657,30 +691,37 @@
     return;
   }
   
-  [_captureSession beginConfiguration];
-  [_videoController setIsAudioEnabled:isAudioEnabled];
-  [_videoController setIsAudioSetup:NO];
-  [_videoController setAudioIsDisconnected:YES];
-  
-  // Only remove audio channel input but keep video
-  for (AVCaptureInput *input in [_captureSession inputs]) {
-    for (AVCaptureInputPort *port in input.ports) {
-      if ([[port mediaType] isEqual:AVMediaTypeAudio]) {
-        [_captureSession removeInput:input];
-        break;
+  // AVFoundation throws an NSGenericException ("startRunning may not be called
+  // between calls to beginConfiguration and commitConfiguration") when the session
+  // is reconfigured on one thread while -startRunning runs on another. Flutter
+  // delivers this call on the main queue while start/stop run on _dispatchQueue,
+  // so every session mutation takes the session's own (recursive) lock.
+  @synchronized (_captureSession) {
+    [_captureSession beginConfiguration];
+    [_videoController setIsAudioEnabled:isAudioEnabled];
+    [_videoController setIsAudioSetup:NO];
+    [_videoController setAudioIsDisconnected:YES];
+
+    // Only remove audio channel input but keep video
+    for (AVCaptureInput *input in [_captureSession inputs]) {
+      for (AVCaptureInputPort *port in input.ports) {
+        if ([[port mediaType] isEqual:AVMediaTypeAudio]) {
+          [_captureSession removeInput:input];
+          break;
+        }
       }
     }
+    // Only remove audio channel output but keep video
+    [_captureSession removeOutput:_audioOutput];
+
+    if (_videoController.isRecording) {
+      [self setUpCaptureSessionForAudioError:^(NSError *error) {
+        completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"error when trying to setup audio" details:[error localizedDescription]]);
+      }];
+    }
+
+    [_captureSession commitConfiguration];
   }
-  // Only remove audio channel output but keep video
-  [_captureSession removeOutput:_audioOutput];
-  
-  if (_videoController.isRecording) {
-    [self setUpCaptureSessionForAudioError:^(NSError *error) {
-      completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"error when trying to setup audio" details:[error localizedDescription]]);
-    }];
-  }
-  
-  [_captureSession commitConfiguration];
   completion(@(YES), nil);
 }
 

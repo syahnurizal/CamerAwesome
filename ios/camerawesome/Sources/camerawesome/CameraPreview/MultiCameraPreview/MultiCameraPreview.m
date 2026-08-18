@@ -55,24 +55,34 @@
 }
 
 - (void)dispose {
-  [self stop];
-  [self cleanSession];
+  // -stop and -cleanSession take the same recursive lock, so nesting is fine.
+  @synchronized (self.cameraSession) {
+    [self stop];
+    [self cleanSession];
+  }
 }
 
 - (void)stop {
-  [self.cameraSession stopRunning];
+  @synchronized (self.cameraSession) {
+    [self.cameraSession stopRunning];
+  }
 }
 
+/// Note: this opens a configuration block that it does NOT commit - the caller
+/// (-setSensors:) commits once the new sensors have been added. Both take the
+/// session lock so the half-configured session is never visible to -startRunning.
 - (void)cleanSession {
-  [self.cameraSession beginConfiguration];
-  
-  for (CameraDeviceInfo *camera in self.devices) {
-    [self.cameraSession removeConnection:camera.captureConnection];
-    [self.cameraSession removeInput:camera.deviceInput];
-    [self.cameraSession removeOutput:camera.videoDataOutput];
+  @synchronized (self.cameraSession) {
+    [self.cameraSession beginConfiguration];
+
+    for (CameraDeviceInfo *camera in self.devices) {
+      [self.cameraSession removeConnection:camera.captureConnection];
+      [self.cameraSession removeInput:camera.deviceInput];
+      [self.cameraSession removeOutput:camera.videoDataOutput];
+    }
+
+    [self.devices removeAllObjects];
   }
-  
-  [self.devices removeAllObjects];
 }
 
 // Get max zoom level
@@ -205,12 +215,12 @@
 }
 
 - (void)refresh {
-  if ([self.cameraSession isRunning]) {
-    [self.cameraSession stopRunning];
+  @synchronized (self.cameraSession) {
+    if ([self.cameraSession isRunning]) {
+      [self.cameraSession stopRunning];
+    }
   }
-  dispatch_async(_dispatchQueue, ^{
-    [self.cameraSession startRunning];
-  });
+  [self start];
 }
 
 - (void)configInitialSession:(NSArray<PigeonSensor *> *)sensors {  
@@ -221,27 +231,49 @@
     [self.textures addObject:previewTexture];
   }
   
-  [self setSensors:sensors];
-  
-  [self.cameraSession commitConfiguration];
+  // The session was only just created above, so the lock starts here.
+  @synchronized (self.cameraSession) {
+    [self setSensors:sensors];
+
+    [self.cameraSession commitConfiguration];
+  }
 }
 
 - (void)setSensors:(NSArray<PigeonSensor *> *)sensors {
-  [self cleanSession];
-  
-  _sensors = sensors;
-  
-  for (int i = 0; i < [sensors count]; i++) {
-    PigeonSensor *sensor = sensors[i];
-    [self addSensor:sensor withIndex:i];
+  // AVFoundation throws an NSGenericException ("startRunning may not be called
+  // between calls to beginConfiguration and commitConfiguration") when the session
+  // is reconfigured on one thread while -startRunning runs on another. Flutter
+  // delivers this call on the main queue while start/stop run on _dispatchQueue,
+  // so every session mutation takes the session's own (recursive) lock.
+  // -cleanSession opens the configuration block that is committed at the end here,
+  // so the whole method has to be atomic, not just the commit.
+  @synchronized (self.cameraSession) {
+    [self cleanSession];
+
+    _sensors = sensors;
+
+    for (int i = 0; i < [sensors count]; i++) {
+      PigeonSensor *sensor = sensors[i];
+      [self addSensor:sensor withIndex:i];
+    }
+
+    [self.cameraSession commitConfiguration];
   }
-  
-  [self.cameraSession commitConfiguration];
 }
 
 - (void)start {
   dispatch_async(_dispatchQueue, ^{
-    [self.cameraSession startRunning];
+    // The lock keeps this out of any beginConfiguration/commitConfiguration block
+    // running on another thread. The @catch is a safety net: should a
+    // reconfiguration path ever be added without the lock, the session fails to
+    // start instead of throwing an uncaught NSGenericException that kills the app.
+    @synchronized (self.cameraSession) {
+      @try {
+        [self.cameraSession startRunning];
+      } @catch (NSException *exception) {
+        NSLog(@"camerawesome: -[AVCaptureSession startRunning] failed: %@ - %@", exception.name, exception.reason);
+      }
+    }
   });
 }
 
