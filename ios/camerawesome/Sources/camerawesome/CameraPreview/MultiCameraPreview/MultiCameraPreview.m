@@ -7,7 +7,29 @@
 
 #import "MultiCameraPreview.h"
 
+/// Identity tag for _dispatchQueue - see -runOnCameraQueue:.
+static const void * const kMultiCameraQueueKey = &kMultiCameraQueueKey;
+
 @implementation MultiCameraPreview
+
+/// Funnels every AVCaptureSession mutation onto the single serial camera queue.
+///
+/// AVFoundation throws an NSGenericException ("startRunning may not be called
+/// between calls to beginConfiguration and commitConfiguration") if -startRunning
+/// runs while another thread sits inside a configuration block, and Flutter
+/// delivers the setters on the main queue while start/stop run on _dispatchQueue.
+///
+/// A serial queue rather than a lock: sample buffers are delivered on the main
+/// queue and -startRunning blocks for the full camera warm-up, so making the main
+/// thread wait on the camera would stall frame delivery and delay the preview by
+/// seconds. dispatch_sync is never used here for the same reason.
+- (void)runOnCameraQueue:(dispatch_block_t)block {
+  if (dispatch_get_specific(kMultiCameraQueueKey) != NULL) {
+    block();
+  } else {
+    dispatch_async(_dispatchQueue, block);
+  }
+}
 
 - (instancetype)initWithSensors:(NSArray<PigeonSensor *> *)sensors
               mirrorFrontCamera:(BOOL)mirrorFrontCamera
@@ -17,6 +39,7 @@
                   dispatchQueue:(dispatch_queue_t)dispatchQueue {
   if (self = [super init]) {
     _dispatchQueue = dispatchQueue;
+    dispatch_queue_set_specific(_dispatchQueue, kMultiCameraQueueKey, (void *)kMultiCameraQueueKey, NULL);
     
     _textures = [NSMutableArray new];
     _devices = [NSMutableArray new];
@@ -55,24 +78,24 @@
 }
 
 - (void)dispose {
-  // -stop and -cleanSession take the same recursive lock, so nesting is fine.
-  @synchronized (self.cameraSession) {
+  // -stop and -cleanSession run inline here, since we are already on the queue.
+  [self runOnCameraQueue:^{
     [self stop];
     [self cleanSession];
-  }
+  }];
 }
 
 - (void)stop {
-  @synchronized (self.cameraSession) {
+  [self runOnCameraQueue:^{
     [self.cameraSession stopRunning];
-  }
+  }];
 }
 
 /// Note: this opens a configuration block that it does NOT commit - the caller
-/// (-setSensors:) commits once the new sensors have been added. Both take the
-/// session lock so the half-configured session is never visible to -startRunning.
+/// (-setSensors:) commits once the new sensors have been added. Both run on the
+/// camera queue so the half-configured session is never visible to -startRunning.
 - (void)cleanSession {
-  @synchronized (self.cameraSession) {
+  [self runOnCameraQueue:^{
     [self.cameraSession beginConfiguration];
 
     for (CameraDeviceInfo *camera in self.devices) {
@@ -82,7 +105,7 @@
     }
 
     [self.devices removeAllObjects];
-  }
+  }];
 }
 
 // Get max zoom level
@@ -215,11 +238,11 @@
 }
 
 - (void)refresh {
-  @synchronized (self.cameraSession) {
+  [self runOnCameraQueue:^{
     if ([self.cameraSession isRunning]) {
       [self.cameraSession stopRunning];
     }
-  }
+  }];
   [self start];
 }
 
@@ -231,26 +254,23 @@
     [self.textures addObject:previewTexture];
   }
   
-  // The session was only just created above, so the lock starts here.
-  @synchronized (self.cameraSession) {
+  // The session was only just created above, so the funnel starts here.
+  // -setSensors: runs inline within this block and leaves the configuration
+  // block open; the commit below closes it, so the two must not be split apart.
+  [self runOnCameraQueue:^{
     [self setSensors:sensors];
 
     [self.cameraSession commitConfiguration];
-  }
+  }];
 }
 
 - (void)setSensors:(NSArray<PigeonSensor *> *)sensors {
-  // AVFoundation throws an NSGenericException ("startRunning may not be called
-  // between calls to beginConfiguration and commitConfiguration") when the session
-  // is reconfigured on one thread while -startRunning runs on another. Flutter
-  // delivers this call on the main queue while start/stop run on _dispatchQueue,
-  // so every session mutation takes the session's own (recursive) lock.
-  // -cleanSession opens the configuration block that is committed at the end here,
-  // so the whole method has to be atomic, not just the commit.
-  @synchronized (self.cameraSession) {
+  // -cleanSession opens the configuration block that is committed at the end
+  // here, so the whole method has to be atomic, not just the commit.
+  [self runOnCameraQueue:^{
     [self cleanSession];
 
-    _sensors = sensors;
+    self->_sensors = sensors;
 
     for (int i = 0; i < [sensors count]; i++) {
       PigeonSensor *sensor = sensors[i];
@@ -258,23 +278,21 @@
     }
 
     [self.cameraSession commitConfiguration];
-  }
+  }];
 }
 
 - (void)start {
-  dispatch_async(_dispatchQueue, ^{
-    // The lock keeps this out of any beginConfiguration/commitConfiguration block
-    // running on another thread. The @catch is a safety net: should a
-    // reconfiguration path ever be added without the lock, the session fails to
-    // start instead of throwing an uncaught NSGenericException that kills the app.
-    @synchronized (self.cameraSession) {
-      @try {
-        [self.cameraSession startRunning];
-      } @catch (NSException *exception) {
-        NSLog(@"camerawesome: -[AVCaptureSession startRunning] failed: %@ - %@", exception.name, exception.reason);
-      }
+  // Serialising on the camera queue keeps this out of any
+  // beginConfiguration/commitConfiguration block. The @catch is a safety net:
+  // should a reconfiguration path ever be added that bypasses the queue, the
+  // session fails to start instead of throwing an uncaught NSGenericException.
+  [self runOnCameraQueue:^{
+    @try {
+      [self.cameraSession startRunning];
+    } @catch (NSException *exception) {
+      NSLog(@"camerawesome: -[AVCaptureSession startRunning] failed: %@ - %@", exception.name, exception.reason);
     }
-  });
+  }];
 }
 
 - (CGSize)getEffectivPreviewSize {
